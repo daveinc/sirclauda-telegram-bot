@@ -74,7 +74,7 @@ def find_existing_bot() -> int | None:
     """Return PID of already-running bot.py, or None."""
     try:
         result = subprocess.run(
-            ["wmic", "process", "where", "commandline like '%bot.py%'", "get", "processid"],
+            ["wmic", "process", "where", "name='python.exe' and commandline like '%bot.py%'", "get", "processid"],
             capture_output=True, text=True
         )
         for line in result.stdout.splitlines():

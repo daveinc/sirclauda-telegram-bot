@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import time
 import subprocess
@@ -14,6 +15,7 @@ SESSIONS_FILE = "sessions.json"
 SUBSCRIPTIONS_FILE = "subscriptions.json"
 HEARTBEAT_FILE = "heartbeat.json"
 ACTIVE_TAB_FILE = "active_tab.json"
+LOCK_FILE = "bot.lock"
 TIMEOUT = 300
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -284,7 +286,39 @@ def handle_message(message):
         bot.edit_message_text(f"[{label}] Error: {e}", chat_id=message.chat.id, message_id=ack.message_id)
 
 
+def acquire_lock() -> bool:
+    """Returns False if another instance is already running."""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE) as f:
+                pid = int(f.read().strip())
+            # Check if that PID is actually alive
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True
+            )
+            if str(pid) in result.stdout:
+                print(f"Another instance already running (PID {pid}). Exiting.")
+                return False
+        except Exception:
+            pass
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    if not acquire_lock():
+        sys.exit(1)
+    import atexit
+    atexit.register(release_lock)
     write_heartbeat("idle")
     print("SirClauda bot is running...")
     bot.infinity_polling()
