@@ -37,13 +37,13 @@ def find_current_session() -> tuple[str, str] | None:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python register.py <tagname>")
-        sys.exit(1)
-
-    tag = sys.argv[1].lstrip("#").lower()
-
     cwd = os.getcwd()
+
+    if len(sys.argv) >= 2:
+        tag = sys.argv[1].lstrip("#").lower()
+    else:
+        # Auto-detect: use the project folder basename as the tag
+        tag = os.path.basename(cwd).lower().replace(" ", "-")
 
     result = find_current_session()
     if not result:

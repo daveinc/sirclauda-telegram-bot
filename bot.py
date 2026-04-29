@@ -3,7 +3,9 @@ import re
 import sys
 import json
 import time
+import queue as queue_module
 import subprocess
+import threading
 import telebot
 from dotenv import load_dotenv
 
@@ -19,7 +21,13 @@ LOCK_FILE = "bot.lock"
 TIMEOUT = 300
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+_sessions_lock = threading.Lock()
+_tab_queues: dict[str, queue_module.Queue] = {}
+_tab_workers: dict[str, threading.Thread] = {}
+_workers_lock = threading.Lock()
 
+
+# ── I/O helpers ──────────────────────────────────────────────────────────────
 
 def is_allowed(chat_id: int) -> bool:
     if not ALLOWED_CHAT_ID:
@@ -74,8 +82,17 @@ def write_heartbeat(state: str, eta_seconds: int = 0):
         json.dump(hb, f)
 
 
+def read_heartbeat() -> dict | None:
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ── Claude helpers ────────────────────────────────────────────────────────────
+
 def estimate_eta(task: str) -> int:
-    """Ask Haiku to estimate task duration in seconds. Returns 300 as fallback."""
     result = subprocess.run(
         ["claude", "-p", "--bare", "--model", "haiku",
          f"Reply with a single integer — the number of seconds this task will likely take. No other text.\n\nTask: {task}"],
@@ -112,6 +129,29 @@ def ask_claude(message: str, session: dict | str | None = None) -> tuple[str, st
     return data.get("result", "").strip(), data.get("session_id", session_id)
 
 
+def summarize(reply: str) -> str:
+    result = subprocess.run(
+        ["claude", "-p", "--bare", "--model", "haiku",
+         f"Summarize in 10 words or less what was just done:\n\n{reply}"],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return " ".join(reply.split()[:10]) + "..."
+
+
+# ── Telegram helpers ──────────────────────────────────────────────────────────
+
+def send_chunked(chat_id: int, reply_to_id: int, text: str, chunk_size: int = 4000):
+    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    for i, chunk in enumerate(chunks):
+        suffix = f" ({i + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+        if i == 0:
+            bot.send_message(chat_id, chunk + suffix, reply_to_message_id=reply_to_id)
+        else:
+            bot.send_message(chat_id, chunk + suffix)
+
+
 def parse_tab(text: str) -> tuple[str | None, str]:
     if text.startswith("#"):
         parts = text[1:].split(None, 1)
@@ -131,16 +171,67 @@ def parse_subscription_intent(text: str) -> tuple[str, str] | None:
     return None
 
 
-def summarize(reply: str) -> str:
-    result = subprocess.run(
-        ["claude", "-p", "--bare", "--model", "haiku",
-         f"Summarize in 10 words or less what was just done:\n\n{reply}"],
-        capture_output=True, text=True, timeout=30
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    return " ".join(reply.split()[:10]) + "..."
+# ── Per-tab message queue ─────────────────────────────────────────────────────
 
+def get_queue(tab: str) -> queue_module.Queue:
+    with _workers_lock:
+        if tab not in _tab_queues:
+            _tab_queues[tab] = queue_module.Queue()
+            t = threading.Thread(target=worker_loop, args=(tab,), daemon=True)
+            _tab_workers[tab] = t
+            t.start()
+        return _tab_queues[tab]
+
+
+def worker_loop(tab: str):
+    while True:
+        job = _tab_queues[tab].get()
+        process_job(tab, job)
+        _tab_queues[tab].task_done()
+
+
+def process_job(tab: str, job: dict):
+    message = job["message"]
+    text = job["text"]
+    ack = job["ack"]
+    label = job["label"]
+
+    with _sessions_lock:
+        sessions = load_sessions()
+    session = sessions.get(tab)
+
+    eta_seconds = estimate_eta(text)
+    write_heartbeat("busy", eta_seconds)
+
+    try:
+        reply, new_session_id = ask_claude(text, session)
+
+        if new_session_id:
+            with _sessions_lock:
+                sessions = load_sessions()
+                if isinstance(sessions.get(tab), dict):
+                    sessions[tab]["session_id"] = new_session_id
+                else:
+                    sessions[tab] = new_session_id
+                save_sessions(sessions)
+
+        write_heartbeat("idle")
+        bot.edit_message_text(f"[{label}] Done.", chat_id=message.chat.id, message_id=ack.message_id)
+        send_chunked(message.chat.id, message.message_id, f"[{label}] {reply}")
+
+        subs = load_subscriptions()
+        if tab in subs:
+            bot.send_message(message.chat.id, f"Summary [{label}]: {summarize(reply)}")
+
+    except subprocess.TimeoutExpired:
+        write_heartbeat("idle")
+        bot.edit_message_text(f"[{label}] Timed out.", chat_id=message.chat.id, message_id=ack.message_id)
+    except Exception as e:
+        write_heartbeat("idle")
+        bot.edit_message_text(f"[{label}] Error: {e}", chat_id=message.chat.id, message_id=ack.message_id)
+
+
+# ── Command handlers ──────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
@@ -155,6 +246,8 @@ def handle_start(message):
         "  /tab — show active tab\n"
         "  /tab #name — switch active tab\n"
         "  /tabs — all sessions + subscription status\n"
+        "  /status — live state of each tab\n"
+        "  /history [tab] [n] — last N exchanges (default 5)\n"
         "  /subscriptions — list subscribed tabs\n"
         "  /clear [tab] — clear a session\n\n"
         "Subscriptions:\n"
@@ -192,6 +285,101 @@ def handle_tabs(message):
         sub = " [subscribed]" if k in subs else ""
         lines.append(f"  #{k}: {sid}...{cwd}{sub}")
     bot.reply_to(message, "Sessions:\n" + "\n".join(lines))
+
+
+@bot.message_handler(commands=["status"])
+def handle_status(message):
+    if not is_allowed(message.chat.id):
+        return
+    sessions = load_sessions()
+    hb = read_heartbeat()
+    active = load_active_tab()
+
+    if not sessions:
+        bot.reply_to(message, f"No active sessions.\nActive tab: #{active}")
+        return
+
+    lines = []
+    for tab, v in sessions.items():
+        cwd = v.get("cwd", "unknown") if isinstance(v, dict) else "unknown"
+        project = os.path.basename(cwd) if cwd != "unknown" else "unknown"
+        q_depth = _tab_queues[tab].qsize() if tab in _tab_queues else 0
+
+        if hb and hb.get("state") == "busy":
+            eta_in = max(0, int(hb.get("eta", 0) - time.time()))
+            state = f"busy (ETA ~{eta_in}s)"
+        else:
+            state = "idle"
+
+        if q_depth > 0:
+            state += f", {q_depth} queued"
+
+        star = " *" if tab == active else ""
+        lines.append(f"#{tab} [{project}]: {state}{star}")
+
+    bot.reply_to(message, "Status:\n" + "\n".join(lines) + "\n\n* = active tab")
+
+
+@bot.message_handler(commands=["history"])
+def handle_history(message):
+    if not is_allowed(message.chat.id):
+        return
+    parts = message.text.split()
+    tab = parts[1].lstrip("#").lower() if len(parts) > 1 else load_active_tab()
+    try:
+        n = int(parts[2]) if len(parts) > 2 else 5
+    except ValueError:
+        n = 5
+
+    sessions = load_sessions()
+    session = sessions.get(tab)
+    if not session:
+        bot.reply_to(message, f"No session for #{tab}.")
+        return
+
+    session_id = session.get("session_id") if isinstance(session, dict) else session
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    jsonl_path = None
+    for root, _dirs, files in os.walk(projects_dir):
+        for fname in files:
+            if fname == f"{session_id}.jsonl":
+                jsonl_path = os.path.join(root, fname)
+                break
+        if jsonl_path:
+            break
+
+    if not jsonl_path:
+        bot.reply_to(message, f"Session file not found for #{tab}.")
+        return
+
+    entries = []
+    with open(jsonl_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                if entry.get("type") in ("user", "assistant"):
+                    entries.append(entry)
+            except Exception:
+                continue
+
+    last = entries[-(n * 2):]
+    lines = []
+    for e in last:
+        role = "You" if e.get("type") == "user" else "Claude"
+        content = e.get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        lines.append(f"{role}: {str(content)[:300]}")
+
+    if not lines:
+        bot.reply_to(message, f"No messages found in #{tab} history.")
+        return
+
+    send_chunked(
+        message.chat.id,
+        message.message_id,
+        f"History [#{tab}] (last {n}):\n\n" + "\n\n".join(lines),
+    )
 
 
 @bot.message_handler(commands=["subscriptions"])
@@ -246,53 +434,30 @@ def handle_message(message):
         return
 
     if tab:
-        # Explicit tag — switch active tab
         save_active_tab(tab)
     else:
-        # No tag — use current active tab
         tab = load_active_tab()
-    sessions = load_sessions()
-    session = sessions.get(tab)
+
     label = f"#{tab}" if tab != "default" else "default"
+    q = get_queue(tab)
+    depth = q.qsize()
 
-    ack = bot.reply_to(message, f"[{label}] Received - working on it...")
+    if depth > 0:
+        ack = bot.reply_to(message, f"[{label}] Received - queued (position {depth + 1})")
+    else:
+        ack = bot.reply_to(message, f"[{label}] Received - working on it...")
+
     bot.send_chat_action(message.chat.id, "typing")
-    eta_seconds = estimate_eta(text)
-    write_heartbeat("busy", eta_seconds)
+    q.put({"message": message, "text": text, "tab": tab, "label": label, "ack": ack})
 
-    try:
-        reply, new_session_id = ask_claude(text, session)
 
-        if new_session_id:
-            if isinstance(sessions.get(tab), dict):
-                sessions[tab]["session_id"] = new_session_id
-            else:
-                sessions[tab] = new_session_id
-            save_sessions(sessions)
-
-        write_heartbeat("idle")
-        bot.edit_message_text(f"[{label}] Done.", chat_id=message.chat.id, message_id=ack.message_id)
-        bot.reply_to(message, f"[{label}] {reply}")
-
-        subs = load_subscriptions()
-        if tab in subs:
-            bot.send_message(message.chat.id, f"Summary [{label}]: {summarize(reply)}")
-
-    except subprocess.TimeoutExpired:
-        write_heartbeat("idle")
-        bot.edit_message_text(f"[{label}] Timed out.", chat_id=message.chat.id, message_id=ack.message_id)
-    except Exception as e:
-        write_heartbeat("idle")
-        bot.edit_message_text(f"[{label}] Error: {e}", chat_id=message.chat.id, message_id=ack.message_id)
-
+# ── Process lock ──────────────────────────────────────────────────────────────
 
 def acquire_lock() -> bool:
-    """Returns False if another instance is already running."""
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE) as f:
                 pid = int(f.read().strip())
-            # Check if that PID is actually alive
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True, text=True
