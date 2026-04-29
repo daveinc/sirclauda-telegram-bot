@@ -15,13 +15,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
 SESSIONS_FILE = "sessions.json"
 SUBSCRIPTIONS_FILE = "subscriptions.json"
+CONVERSATIONS_FILE = "conversations.json"
 HEARTBEAT_FILE = "heartbeat.json"
 ACTIVE_TAB_FILE = "active_tab.json"
 LOCK_FILE = "bot.lock"
 TIMEOUT = 300
+HISTORY_MAX = 10   # pairs stored per tab
+HISTORY_INJECT = 5 # pairs prepended as context
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 _sessions_lock = threading.Lock()
+_conversations_lock = threading.Lock()
 _tab_queues: dict[str, queue_module.Queue] = {}
 _tab_workers: dict[str, threading.Thread] = {}
 _workers_lock = threading.Lock()
@@ -71,6 +75,42 @@ def save_subscriptions(subs: set):
         json.dump(list(subs), f, indent=2)
 
 
+def load_conversations() -> dict:
+    if os.path.exists(CONVERSATIONS_FILE):
+        with open(CONVERSATIONS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_conversations(convs: dict):
+    with open(CONVERSATIONS_FILE, "w") as f:
+        json.dump(convs, f, indent=2)
+
+
+def update_conversation(tab: str, user_msg: str, assistant_reply: str):
+    with _conversations_lock:
+        convs = load_conversations()
+        history = convs.get(tab, [])
+        history.append({"user": user_msg, "assistant": assistant_reply})
+        convs[tab] = history[-HISTORY_MAX:]
+        save_conversations(convs)
+
+
+def build_context_message(tab: str, text: str) -> str:
+    with _conversations_lock:
+        convs = load_conversations()
+    history = convs.get(tab, [])[-HISTORY_INJECT:]
+    if not history:
+        return text
+    lines = ["[Previous conversation context:]"]
+    for pair in history:
+        lines.append(f"User: {pair['user'][:800]}")
+        lines.append(f"Assistant: {pair['assistant'][:800]}")
+    lines.append("")
+    lines.append(text)
+    return "\n".join(lines)
+
+
 def write_heartbeat(state: str, eta_seconds: int = 0):
     hb = {
         "pid": os.getpid(),
@@ -96,7 +136,7 @@ def estimate_eta(task: str) -> int:
     result = subprocess.run(
         ["claude", "-p", "--bare", "--model", "haiku",
          f"Reply with a single integer — the number of seconds this task will likely take. No other text.\n\nTask: {task}"],
-        capture_output=True, text=True, timeout=15
+        capture_output=True, text=True, encoding="utf-8", timeout=15
     )
     try:
         return max(30, int(result.stdout.strip()))
@@ -117,7 +157,7 @@ def ask_claude(message: str, session: dict | str | None = None) -> tuple[str, st
         cmd += ["--resume", session_id]
     cmd += ["--", message]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd=cwd)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT, cwd=cwd)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
         return f"Error: {detail}", session_id
@@ -133,7 +173,7 @@ def summarize(reply: str) -> str:
     result = subprocess.run(
         ["claude", "-p", "--bare", "--model", "haiku",
          f"Summarize in 10 words or less what was just done:\n\n{reply}"],
-        capture_output=True, text=True, timeout=30
+        capture_output=True, text=True, encoding="utf-8", timeout=30
     )
     if result.returncode == 0:
         return result.stdout.strip()
@@ -204,7 +244,8 @@ def process_job(tab: str, job: dict):
     write_heartbeat("busy", eta_seconds)
 
     try:
-        reply, new_session_id = ask_claude(text, session)
+        full_message = build_context_message(tab, text)
+        reply, new_session_id = ask_claude(full_message, session)
 
         if new_session_id:
             with _sessions_lock:
@@ -214,6 +255,8 @@ def process_job(tab: str, job: dict):
                 else:
                     sessions[tab] = new_session_id
                 save_sessions(sessions)
+
+        update_conversation(tab, text, reply)
 
         write_heartbeat("idle")
         bot.edit_message_text(f"[{label}] Done.", chat_id=message.chat.id, message_id=ack.message_id)
@@ -403,9 +446,15 @@ def handle_clear(message):
         tab = parts[1].lstrip("#").lower()
         sessions.pop(tab, None)
         save_sessions(sessions)
+        with _conversations_lock:
+            convs = load_conversations()
+            convs.pop(tab, None)
+            save_conversations(convs)
         bot.reply_to(message, f"Session #{tab} cleared.")
     else:
         save_sessions({})
+        with _conversations_lock:
+            save_conversations({})
         bot.reply_to(message, "All sessions cleared.")
 
 

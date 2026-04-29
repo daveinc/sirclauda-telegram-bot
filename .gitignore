@@ -3,6 +3,9 @@ sessions.json
 subscriptions.json
 heartbeat.json
 active_tab.json
+conversations.json
 bot.lock
+bot.log
+bot_err.log
 __pycache__/
 *.pyc
