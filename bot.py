@@ -98,7 +98,7 @@ def ask_claude(message: str, session: dict | str | None = None) -> tuple[str, st
     cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
     if session_id:
         cmd += ["--resume", session_id]
-    cmd.append(message)
+    cmd += ["--", message]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd=cwd)
     if result.returncode != 0:
