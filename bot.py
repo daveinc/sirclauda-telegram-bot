@@ -130,6 +130,40 @@ def read_heartbeat() -> dict | None:
         return None
 
 
+# ── Fallback AI helpers ───────────────────────────────────────────────────────
+
+RATE_LIMIT_MARKERS = [
+    "You've hit your limit",
+    "You're out of extra usage",
+    "api_error_status\":429",
+    "resets ",
+]
+
+def is_rate_limited(reply: str) -> bool:
+    return any(m in reply for m in RATE_LIMIT_MARKERS)
+
+
+def ask_fallback(message: str) -> str:
+    safe = message.replace('"', '\\"').replace('\n', ' ')
+    models = [
+        "opencode/minimax-m2.5-free",
+        "google/gemini-2.5-flash",
+    ]
+    for model in models:
+        try:
+            result = subprocess.run(
+                ["wsl", "bash", "-i", "-c",
+                 f'opencode run --dangerously-skip-permissions --format default --variant minimal --model {model} "{safe}"'],
+                capture_output=True, text=True, encoding="utf-8", timeout=120
+            )
+            out = result.stdout.strip()
+            if out and "rate" not in out.lower() and "error" not in out.lower()[:30]:
+                return f"[Fallback: {model.split('/')[-1]}]\n\n{out}"
+        except Exception:
+            continue
+    return "All AI backends are currently rate limited. Try again in a few minutes."
+
+
 # ── Claude helpers ────────────────────────────────────────────────────────────
 
 def estimate_eta(task: str) -> int:
@@ -246,6 +280,10 @@ def process_job(tab: str, job: dict):
     try:
         full_message = build_context_message(tab, text)
         reply, new_session_id = ask_claude(full_message, session)
+
+        if is_rate_limited(reply):
+            reply = ask_fallback(text)
+            new_session_id = None
 
         if new_session_id:
             with _sessions_lock:
@@ -514,8 +552,10 @@ def acquire_lock() -> bool:
             if str(pid) in result.stdout:
                 print(f"Another instance already running (PID {pid}). Exiting.")
                 return False
+            print(f"Stale lock (PID {pid} dead), clearing.")
         except Exception:
             pass
+        os.remove(LOCK_FILE)
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
     return True
